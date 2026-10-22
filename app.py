@@ -1,175 +1,140 @@
-import streamlit as st
+"""Streamlit entry point: page layout and user interaction only.
+
+Data handling, modelling and charts live in the ``avocado_forecast`` package.
+"""
+
+from __future__ import annotations
+
+import io
+from typing import NamedTuple
+
 import pandas as pd
-import plotly.graph_objects as go
-import plotly.express as px
-import seaborn as sns
-import matplotlib.pyplot as plt
-from statsmodels.tsa.statespace.sarimax import SARIMAX
+import streamlit as st
+from streamlit.runtime.uploaded_file_manager import UploadedFile
 
-st.set_page_config(page_title="Avocado Price Forecast", layout="wide")
+from avocado_forecast.charts import VISUALIZATIONS, forecast_chart
+from avocado_forecast.config import (
+    APP_TITLE,
+    DEFAULT_FORECAST_MONTHS,
+    GDRIVE_DATA_URL,
+    MAX_FORECAST_MONTHS,
+    MIN_FORECAST_MONTHS,
+)
+from avocado_forecast.data import DataValidationError, load_dataset, monthly_price_series
+from avocado_forecast.forecasting import forecast_prices
 
-st.markdown("""
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600&display=swap');
-        html, body, [class*="css"] {
-            font-family: 'Poppins', sans-serif;
-            background-color: black !important;
-            color: white !important;
-        }
-        .stApp {
-            background-color: black !important;
-            color: white !important;
-        }
-    </style>
-""", unsafe_allow_html=True)
+FORECAST_STATE_KEY = "forecast_run"
 
-st.title("Prediksi Harga Avocado")
-st.write("Upload file CSV harga avocado untuk analisis visualisasi dan prediksi menggunakan **SARIMA**.")
-
-uploaded_file = st.file_uploader("Unggah file CSV", type=["csv"])
-
-gdrive_link = "https://drive.google.com/drive/folders/1HnuCakpKXkEZBxqHTNphdMHiPObFgrK8?usp=sharing"
-
-st.link_button("📂 Download Data dari Google Drive", gdrive_link)
+st.set_page_config(page_title="Avocado Price Forecast", page_icon="🥑", layout="wide")
 
 
-if uploaded_file:
-    df = pd.read_csv(uploaded_file)
-    df = df.drop(columns=["Unnamed: 0", "year"], errors="ignore")
-    df['Date'] = pd.to_datetime(df['Date'])
-    df = df.sort_values('Date')
+class ForecastRun(NamedTuple):
+    """A finished forecast, kept in session state so it survives widget interactions."""
 
-    opsi_visual = [
-        "Tren Harga & Volume",
-        "Perbandingan Penjualan per Ukuran Avocado",
-        "Komposisi Penjualan Bags",
-        "Perbandingan Harga per Tipe",
-        "Rata-rata Harga per Region",
-        "Korelasi Antar Variabel"
-    ]
+    file_id: str
+    steps: int
+    history: pd.Series
+    forecast: pd.Series
 
-    st.subheader("Visualisasi Data")
-    pilih_vis = st.selectbox("Pilih jenis visualisasi:", opsi_visual)
 
-    # VISUALISASI
-    if pilih_vis == "Tren Harga & Volume":
-        st.subheader("Tren Harga & Volume")
-        monthly_df = df.resample("M", on="Date").mean(numeric_only=True)
+@st.cache_data(show_spinner="Membaca data...")
+def read_upload(file_bytes: bytes) -> pd.DataFrame:
+    """Parse and validate the uploaded CSV (cached by file content)."""
+    return load_dataset(io.BytesIO(file_bytes))
 
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=monthly_df.index, y=monthly_df["AveragePrice"],
-            mode="lines", name="Average Price", line=dict(color="cyan")
-        ))
-        fig.add_trace(go.Scatter(
-            x=monthly_df.index, y=monthly_df["Total Volume"],
-            mode="lines", name="Total Volume", line=dict(color="orange"), yaxis="y2"
-        ))
-        fig.update_layout(
-            yaxis2=dict(title="Total Volume", overlaying="y", side="right"),
-            xaxis_title="Tanggal", yaxis_title="Harga Rata-rata",
-            paper_bgcolor="black", plot_bgcolor="black", font=dict(color="white")
+
+@st.cache_data(show_spinner=False)
+def run_forecast(prices: pd.Series, steps: int) -> pd.Series:
+    """Fit the SARIMA model and forecast (cached by series and horizon)."""
+    return forecast_prices(prices, steps)
+
+
+def render_header() -> None:
+    st.title(APP_TITLE)
+    st.write(
+        "Upload file CSV harga avocado untuk analisis visualisasi dan prediksi "
+        "menggunakan **SARIMA**."
+    )
+
+
+def render_upload() -> UploadedFile | None:
+    col_upload, col_link = st.columns([3, 1], vertical_alignment="bottom")
+    with col_upload:
+        uploaded = st.file_uploader("Unggah file CSV", type=["csv"])
+    with col_link:
+        st.link_button("📂 Download Data dari Google Drive", GDRIVE_DATA_URL, width="stretch")
+    return uploaded
+
+
+def render_visualizations(df: pd.DataFrame) -> None:
+    options = {viz.label: viz for viz in VISUALIZATIONS}
+    choice = st.selectbox("Pilih jenis visualisasi:", list(options))
+
+    viz = options[choice]
+    st.subheader(viz.heading)
+    st.plotly_chart(viz.build(df), width="stretch")
+
+
+def render_forecast(df: pd.DataFrame, file_id: str) -> None:
+    steps = int(
+        st.number_input(
+            "Masukkan jumlah bulan prediksi:",
+            min_value=MIN_FORECAST_MONTHS,
+            max_value=MAX_FORECAST_MONTHS,
+            value=DEFAULT_FORECAST_MONTHS,
         )
-        st.plotly_chart(fig, use_container_width=True)
+    )
 
-    elif pilih_vis == "Perbandingan Penjualan per Ukuran Avocado":
-        st.subheader("Perbandingan Penjualan per Ukuran Avocado")
-        monthly_df = df.resample("M", on="Date").sum(numeric_only=True)
-        fig = go.Figure()
-        for col, color in zip(["4046", "4225", "4770"], ["cyan", "orange", "magenta"]):
-            fig.add_trace(go.Scatter(
-                x=monthly_df.index, y=monthly_df[col],
-                mode="lines", name=col, line=dict(color=color)
-            ))
-        fig.update_layout(
-            xaxis_title="Tanggal", yaxis_title="Volume Penjualan",
-            paper_bgcolor="black", plot_bgcolor="black", font=dict(color="white")
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    if st.button("Jalankan Prediksi", type="primary"):
+        prices = monthly_price_series(df)
+        try:
+            with st.spinner("Melatih model SARIMA..."):
+                forecast = run_forecast(prices, steps)
+        except ValueError as exc:
+            st.error(str(exc))
+        else:
+            st.session_state[FORECAST_STATE_KEY] = ForecastRun(file_id, steps, prices, forecast)
 
-    elif pilih_vis == "Komposisi Penjualan Bags":
-        st.subheader("Komposisi Penjualan Bags")
-        total_bags = df[["Small Bags", "Large Bags", "XLarge Bags"]].sum()
-        fig = px.pie(
-            values=total_bags.values,
-            names=total_bags.index,
-            color_discrete_sequence=px.colors.sequential.Viridis
-        )
-        fig.update_traces(textinfo="percent+label")
-        fig.update_layout(
-            paper_bgcolor="black", font=dict(color="white")
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    # Rendered from session state (not from the button click) so the result stays visible
+    # when the user changes another widget, e.g. the visualization dropdown.
+    run: ForecastRun | None = st.session_state.get(FORECAST_STATE_KEY)
+    if run is None or run.file_id != file_id:
+        return
 
-    elif pilih_vis == "Perbandingan Harga per Tipe":
-        st.subheader("Perbandingan Harga per Tipe (Conventional vs Organic)")
-        tipe_df = df.groupby("type")["AveragePrice"].mean().reset_index()
-        fig = px.bar(
-            tipe_df, x="type", y="AveragePrice",
-            color="type", text_auto=True
-        )
-        fig.update_layout(
-            xaxis_title="Tipe", yaxis_title="Harga Rata-rata",
-            paper_bgcolor="black", plot_bgcolor="black", font=dict(color="white")
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(forecast_chart(run.history, run.forecast, run.steps), width="stretch")
 
-    elif pilih_vis == "Rata-rata Harga per Region":
-        st.subheader("Rata-rata Harga per Region (Top 10)")
-        region_df = df.groupby("region")["AveragePrice"].mean().nlargest(10).reset_index()
-        fig = px.bar(
-            region_df, x="region", y="AveragePrice",
-            color="region", text_auto=True
-        )
-        fig.update_layout(
-            xaxis_title="Region", yaxis_title="Harga Rata-rata",
-            paper_bgcolor="black", plot_bgcolor="black", font=dict(color="white")
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    st.subheader("Tabel Hasil Prediksi")
+    table = run.forecast.rename_axis("Tanggal").reset_index()
+    st.dataframe(
+        table,
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "Tanggal": st.column_config.DateColumn("Tanggal", format="YYYY-MM-DD"),
+            "Prediksi Harga": st.column_config.NumberColumn("Prediksi Harga", format="%.2f"),
+        },
+    )
 
-    elif pilih_vis == "Korelasi Antar Variabel":
-        st.subheader("Korelasi Antar Variabel")
-        corr = df.corr(numeric_only=True)
-        fig, ax = plt.subplots(figsize=(10,6))
-        sns.heatmap(corr, annot=True, cmap="coolwarm", ax=ax)
-        st.pyplot(fig)
 
-    # PREDIKSI
-    st.subheader("Prediksi Harga Avocado")
-    forecast_steps = st.number_input("Masukkan jumlah bulan prediksi:", min_value=1, max_value=36, value=12)
+def main() -> None:
+    render_header()
+    uploaded = render_upload()
 
-    if "AveragePrice" in df.columns:
-        price_df = df[["Date", "AveragePrice"]].resample("M", on="Date").mean()
+    if uploaded is None:
+        st.info("Silakan unggah file CSV untuk memulai analisis.")
+        return
 
-        if st.button("Jalankan Prediksi"):
-            model = SARIMAX(price_df['AveragePrice'], order=(1,1,1), seasonal_order=(1,1,1,12))
-            model_fit = model.fit(disp=False)
-            forecast = model_fit.forecast(steps=forecast_steps)
+    try:
+        df = read_upload(uploaded.getvalue())
+    except DataValidationError as exc:
+        st.error(str(exc))
+        return
 
-            fig_forecast = go.Figure()
-            fig_forecast.add_trace(go.Scatter(
-                x=price_df.index, y=price_df['AveragePrice'],
-                mode='lines', name='Data Historis',
-                line=dict(color='cyan')
-            ))
-            fig_forecast.add_trace(go.Scatter(
-                x=forecast.index, y=forecast,
-                mode='lines+markers', name='Prediksi',
-                line=dict(color='orange'), marker=dict(size=6)
-            ))
-            fig_forecast.update_layout(
-                title=f"Prediksi Harga Avocado {forecast_steps} Bulan ke Depan",
-                xaxis_title="Tanggal", yaxis_title="Harga",
-                paper_bgcolor="black", plot_bgcolor="black", font=dict(color="white")
-            )
-            st.plotly_chart(fig_forecast, use_container_width=True)
+    tab_visual, tab_forecast = st.tabs(["📊 Visualisasi Data", "📈 Prediksi Harga"])
+    with tab_visual:
+        render_visualizations(df)
+    with tab_forecast:
+        render_forecast(df, uploaded.file_id)
 
-            forecast_df = pd.DataFrame({
-                "Tanggal": forecast.index,
-                "Prediksi Harga": forecast.values
-            })
-            st.subheader("Tabel Hasil Prediksi")
-            st.dataframe(forecast_df.style.format({"Prediksi Harga": "{:.2f}"}))
 
-else:
-    st.info("Silakan unggah file CSV untuk memulai analisis.")
+main()
